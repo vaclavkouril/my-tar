@@ -538,17 +538,31 @@ alloc_found(struct options *opt)
 }
 
 static int
-process_header_block(FILE *fp, unsigned char b[BLOCKSIZE],
-    struct options *opt, int *found, fn_file_handler handler,
-    uint64_t *size)
+check_first_header(struct posix_header *hdr, uint64_t block_num)
+{
+	if (block_num != 1) {
+		return (0);
+	}
+
+	if (!is_tar_header(hdr)) {
+		print_error("This does not look like a tar archive");
+		print_exist_prev_err();
+		return (2);
+	}
+
+	return (0);
+}
+
+static int
+process_header_block(FILE *fp, unsigned char b[BLOCKSIZE], struct options *opt,
+			int *found, fn_file_handler handler,
+			uint64_t block_num, uint64_t *size)
 {
 	struct posix_header *hdr;
 
 	hdr = (struct posix_header *)b;
 
-	if (!is_tar_header(hdr)) {
-		print_error("This does not look like a tar archive");
-		print_exist_prev_err();
+	if (check_first_header(hdr, block_num) != 0) {
 		return (2);
 	}
 
@@ -628,7 +642,8 @@ process_archive(FILE *fp, struct options *opt, fn_file_handler handler)
 			break;
 		}
 
-		rc = process_header_block(fp, b, opt, found, handler, &size);
+		rc = process_header_block(fp, b, opt,
+			    found, handler, block_num, &size);
 		if (rc != 0) {
 			break;
 		}
