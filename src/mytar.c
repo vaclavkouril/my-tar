@@ -56,6 +56,9 @@ enum arg_type {
 	ARG_FILENAME
 };
 
+typedef int (*fn_file_handler)(FILE *archive, struct posix_header *hdr,
+				uint64_t size, struct options *opt, int *found);
+
 static void
 print_error(const char *msg)
 {
@@ -131,83 +134,49 @@ type_arg_assign(const char *arg)
 	return (ARG_FILENAME);
 }
 
+static int
+args_error(struct options *opt, const char *msg)
+{
+	print_error(msg);
+	free(opt->files);
+	return (2);
+}
 
 static int
-parse_args(int argc, char **argv, struct options *opt)
+check_options(struct options *opt, int expect_archive)
+{
+	if (expect_archive) {
+		return (args_error(opt, "option -f requires an argument"));
+	}
+
+	if (opt->archive_name == NULL) {
+		return (args_error(opt, "option -f is required"));
+	}
+
+	if (opt->t_flag == opt->x_flag) {
+		return (args_error(opt, "specify exactly one of -t or -x"));
+	}
+
+	return (0);
+}
+
+static void
+init_options(struct options *opt)
 {
 	opt->t_flag = 0;
 	opt->x_flag = 0;
 	opt->v_flag = 0;
 	opt->archive_name = NULL;
 	opt->file_count = 0;
+	opt->files = NULL;
+}
 
-	if (argc < 2) {
-		print_error("need at least one option");
-		return (2);
-	}
-
-	opt->files = malloc((size_t) argc * sizeof (char *));
+static int
+alloc_selected_files(struct options *opt, int argc)
+{
+	opt->files = malloc((size_t)argc * sizeof (char *));
 	if (opt->files == NULL) {
 		print_error("memory exhausted");
-		return (2);
-
-	}
-
-	/* archive name always right after -f option */
-	int expect_archive_nxt = 0;
-
-	for (int i = 1; i < argc; ++i) {
-		int type = type_arg_assign(argv[i]);
-
-		if (expect_archive_nxt) {
-			opt->archive_name = argv[i];
-			expect_archive_nxt = 0;
-			continue;
-		}
-
-		switch (type) {
-			case ARG_OPTION_T:
-				opt->t_flag = 1;
-				break;
-
-			case ARG_OPTION_X:
-				opt->x_flag = 1;
-				break;
-
-			case ARG_OPTION_V:
-				opt->v_flag = 1;
-				break;
-
-			case ARG_OPTION_F:
-				expect_archive_nxt = 1;
-				break;
-
-			case ARG_FILENAME:
-				opt->files[opt->file_count++] = argv[i];
-				break;
-
-			default:
-				print_error_arg("Unknown option: ", argv[i]);
-				free(opt->files);
-				return (2);
-		}
-	}
-
-	if (expect_archive_nxt) {
-		print_error("option -f requires an argument");
-		free(opt->files);
-		return (2);
-	}
-
-	if (opt->archive_name == NULL) {
-		print_error("option -f is required");
-		free(opt->files);
-		return (2);
-	}
-
-	if (opt->t_flag == opt->x_flag) {
-		print_error("specify exactly one of -t or -x");
-		free(opt->files);
 		return (2);
 	}
 
@@ -215,24 +184,92 @@ parse_args(int argc, char **argv, struct options *opt)
 }
 
 static int
-parse_number(const char *field, size_t n, uint64_t *result)
+handle_arg(struct options *opt, char *arg, int *expect_archive)
+{
+	int type;
+
+	if (*expect_archive) {
+		opt->archive_name = arg;
+		*expect_archive = 0;
+		return (0);
+	}
+
+	type = type_arg_assign(arg);
+
+	switch (type) {
+		case ARG_OPTION_T:
+			opt->t_flag = 1;
+			break;
+
+		case ARG_OPTION_X:
+			opt->x_flag = 1;
+			break;
+
+		case ARG_OPTION_V:
+			opt->v_flag = 1;
+			break;
+
+		case ARG_OPTION_F:
+			*expect_archive = 1;
+			break;
+
+		case ARG_FILENAME:
+			opt->files[opt->file_count++] = arg;
+			break;
+
+		default:
+			print_error_arg("Unknown option: ", arg);
+			return (2);
+	}
+
+	return (0);
+}
+
+static int
+parse_args(int argc, char **argv, struct options *opt)
+{
+	init_options(opt);
+
+	/* archive name always right after -f option */
+	int expect_archive = 0;
+
+	if (argc < 2) {
+		print_error("need at least one option");
+		return (2);
+	}
+
+	if (alloc_selected_files(opt, argc) != 0) {
+		return (2);
+	}
+
+	for (int i = 1; i < argc; ++i) {
+		if (handle_arg(opt, argv[i], &expect_archive) != 0) {
+			free(opt->files);
+			return (2);
+		}
+	}
+
+	return (check_options(opt, expect_archive));
+}
+
+static int
+parse_star_size(const char *field, size_t n, uint64_t *result)
 {
 	*result = 0;
 
-	/* star extension type number */
-	if (((unsigned char)field[0] & 0x80) != 0) {
-		/* removing the first mark bit */
-		*result = (uint64_t)((unsigned char)field[0] & 0x7f);
+	/* masking away first mark bit */
+	*result = (uint64_t)((unsigned char)field[0] & 0x7f);
 
-		for (size_t i = 1; i < n; ++i) {
-			*result <<= 8;
-			*result |= (unsigned char)field[i];
-		}
-
-		return (1);
+	for (size_t i = 1; i < n; ++i) {
+		*result <<= 8;
+		*result |= (unsigned char)field[i];
 	}
+	return (1);
+}
 
-	/* standard octet type */
+static int
+parse_octal_size(const char *field, size_t n, uint64_t *result)
+{
 	for (size_t i = 0; i < n; ++i) {
 		/* trailing pad */
 		if (field[i] == '\0' || field[i] == ' ') {
@@ -247,6 +284,22 @@ parse_number(const char *field, size_t n, uint64_t *result)
 		*result += (unsigned char)field[i]  - '0';
 	}
 	return (1);
+}
+
+/*
+ * Header numeric fields are normally stored as octal ASCII. GNU/star archives
+ * may use base-256 encoding for large values. The first bit of the first byte
+ * decides that representation.
+ */
+static int
+parse_hdr_size(const char *field, size_t n, uint64_t *result)
+{
+	*result = 0;
+
+	if (((unsigned char)field[0] & 0x80) != 0) {
+		return (parse_star_size(field, n, result));
+	}
+	return (parse_octal_size(field, n, result));
 }
 
 static int
@@ -265,16 +318,33 @@ read_block(FILE *fp, unsigned char block[BLOCKSIZE])
 	return (1);
 }
 
+/*
+ * Tar file data is padded to 512-byte blocks.  We always read whole blocks,
+ * but write only the actual file size.  If out is NULL, data is only skipped.
+ */
 static int
-skip_data(FILE *fp, uint64_t size)
+copy_data(FILE *in, FILE *out, uint64_t size)
 {
 	unsigned char b[BLOCKSIZE];
-	uint64_t blocks = (size + BLOCKSIZE - 1) / BLOCKSIZE;
+	uint64_t remaining;
+	size_t to_write;
 
-	for (uint64_t i = 0; i < blocks; ++i) {
-		if (read_block(fp, b) != 1) {
+	remaining = size;
+
+	while (remaining > 0) {
+		if (read_block(in, b) != 1) {
 			return (2);
 		}
+
+		to_write = remaining > BLOCKSIZE ?
+			BLOCKSIZE :
+			(size_t)remaining;
+
+		if (out != NULL && fwrite(b, 1, to_write, out) != to_write) {
+			return (2);
+		}
+
+		remaining -= to_write;
 	}
 
 	return (0);
@@ -289,6 +359,36 @@ is_empty_block(const unsigned char block[BLOCKSIZE])
 		}
 	}
 	return (1);
+}
+
+/*
+ * A tar archive normally ends with two zero blocks. GNU tar accepts archives
+ * missing both blocks silently and warns when only one zero block is present.
+ */
+static int
+handle_empty_block(FILE *fp, uint64_t block_num)
+{
+	unsigned char b[BLOCKSIZE];
+	int read_return;
+
+	read_return = read_block(fp, b);
+	if (read_return == 0) {
+		print_warn_lone_empty_block(block_num);
+		return (0);
+	}
+
+	if (read_return < 0) {
+		print_error_eof();
+		return (2);
+	}
+
+	if (is_empty_block(b)) {
+		return (0);
+	}
+
+	/* empty block in the middle of data */
+	print_warn_lone_empty_block(block_num);
+	return (0);
 }
 
 static int
@@ -310,108 +410,232 @@ str_found_in_array(const char *s, int *found, char **arr, size_t n)
 }
 
 static int
-list_archive(FILE *fp, struct options *opt)
+report_nonfound(struct options *opt, int *found)
+{
+	int rc;
+
+	rc = 0;
+	for (int i = 0; i < opt->file_count; ++i) {
+		if (!found[i]) {
+			print_file_not_found_archive(opt->files[i]);
+			rc = 2;
+		}
+	}
+
+	if (rc != 0) {
+		print_exist_prev_err();
+	}
+
+	return (rc);
+}
+
+static int
+should_process_file(const char *name, struct options *opt, int *found)
+{
+	if (opt->file_count == 0) {
+		return (1);
+	}
+
+	return (str_found_in_array(name, found,
+	    opt->files, (size_t)opt->file_count));
+}
+
+static int
+read_header_size(struct posix_header *hdr, uint64_t *size)
+{
+	if (parse_hdr_size(hdr->size, sizeof (hdr->size), size) != 1) {
+		print_error("Malformed tar header");
+		return (2);
+	}
+
+	return (0);
+}
+
+static int
+skip_file_data(FILE *fp, uint64_t size)
+{
+	if (copy_data(fp, NULL, size) != 0) {
+		print_error_eof();
+		return (2);
+	}
+	return (0);
+}
+
+static FILE *
+open_file(const char *filename, const char *mode)
+{
+	FILE *fp;
+
+	fp = fopen(filename, mode);
+	if (fp == NULL) {
+		fprintf(stderr, "mytar: %s: Cannot open: %s\n",
+		    filename, strerror(errno));
+	}
+
+	return (fp);
+}
+
+static int
+list_handler(FILE *archive, struct posix_header *hdr,
+	    uint64_t size, struct options *opt, int *found)
+{
+	if (should_process_file(hdr->name, opt, found)) {
+		print_hdr_name(hdr);
+	}
+	return (skip_file_data(archive, size));
+}
+
+static int
+extract_handler(FILE *archive, struct posix_header *hdr,
+		uint64_t size, struct options *opt, int *found)
+{
+	FILE *out;
+
+	if (!should_process_file(hdr->name, opt, found)) {
+		return (skip_file_data(archive, size));
+	}
+
+	if (opt->v_flag) {
+		print_hdr_name(hdr);
+	}
+
+	out = open_file(hdr->name, "wb");
+	if (out == NULL) {
+		return (2);
+	}
+
+	if (copy_data(archive, out, size) != 0) {
+		fclose(out);
+		print_error_eof();
+		return (2);
+	}
+
+	fclose(out);
+	return (0);
+}
+
+static int
+is_tar_header(struct posix_header *hdr)
+{
+	return (memcmp(hdr->magic, TMAGIC, TMAGLEN) == 0);
+}
+
+static int *
+alloc_found(struct options *opt)
+{
+	int *found;
+
+	if (opt->file_count == 0) {
+		return (NULL);
+	}
+
+	found = calloc((size_t)opt->file_count, sizeof (int));
+	if (found == NULL) {
+		print_error("memory exhausted");
+	}
+
+	return (found);
+}
+
+static int
+process_header_block(FILE *fp, unsigned char b[BLOCKSIZE],
+    struct options *opt, int *found, fn_file_handler handler,
+    uint64_t *size)
+{
+	struct posix_header *hdr;
+
+	hdr = (struct posix_header *)b;
+
+	if (!is_tar_header(hdr)) {
+		print_error("This does not look like a tar archive");
+		print_exist_prev_err();
+		return (2);
+	}
+
+	if (!is_supported_header_type(hdr)) {
+		print_unsupp_typeflag(hdr->typeflag);
+		return (2);
+	}
+
+	if (read_header_size(hdr, size) != 0) {
+		return (2);
+	}
+
+	return (handler(fp, hdr, *size, opt, found));
+}
+
+enum header_status {
+	HDR_OK,
+	HDR_END,
+	HDR_ERROR
+};
+
+static int
+read_next_header(FILE *fp, unsigned char b[BLOCKSIZE], uint64_t *block_num)
+{
+	int read_return;
+
+	read_return = read_block(fp, b);
+	if (read_return == 0) {
+		return (HDR_END);
+	}
+
+	if (read_return < 0) {
+		print_error_eof();
+		return (HDR_ERROR);
+	}
+
+	++(*block_num);
+
+	if (is_empty_block(b)) {
+		if (handle_empty_block(fp, *block_num) != 0) {
+			return (HDR_ERROR);
+		}
+		return (HDR_END);
+	}
+
+	return (HDR_OK);
+}
+
+/*
+ * Archive traversal. The handler decides whether a regular file is
+ * listed, extracted, or skipped.
+ */
+static int
+process_archive(FILE *fp, struct options *opt, fn_file_handler handler)
 {
 	unsigned char b[BLOCKSIZE];
 	uint64_t size;
-	struct posix_header *hdr;
 	uint64_t block_num = 0;
-	int read_return;
+	int status;
 	int *found = NULL;
 	int rc = 0;
-	uint64_t not_found_num = 0;
 
-	if (opt->file_count > 0) {
-		found = calloc((size_t)opt->file_count, sizeof (int));
-		if (found == NULL) {
-			print_error("memory exhausted");
-			return (2);
-		}
+	found = alloc_found(opt);
+	if (opt->file_count > 0 && found == NULL) {
+		return (2);
 	}
-
 
 	while (1) {
-		read_return = read_block(fp, b);
-		if (read_return == 0) {
-			rc = 0;
+		status = read_next_header(fp, b, &block_num);
+
+		if (status == HDR_END) {
 			break;
 		}
-		if (read_return < 0) {
-			print_error_eof();
+
+		if (status == HDR_ERROR) {
 			rc = 2;
 			break;
 		}
 
-		++block_num;
-
-		if (is_empty_block(b)) {
-			read_return = read_block(fp, b);
-			if (read_return == 0) {
-				print_warn_lone_empty_block(block_num);
-				rc = 0;
-				break;
-			}
-
-			if (read_return < 0) {
-				print_error_eof();
-				rc = 2;
-				break;
-			}
-
-			if (is_empty_block(b)) {
-				rc = 0;
-				break;
-			}
-
-			/* empty block in the middle of data */
-			print_warn_lone_empty_block(block_num);
-			rc = 0;
+		rc = process_header_block(fp, b, opt, found, handler, &size);
+		if (rc != 0) {
 			break;
 		}
-
-		hdr = (struct posix_header *)b;
-
-		if (!is_supported_header_type(hdr)) {
-			print_unsupp_typeflag(hdr->typeflag);
-			rc = 2;
-			break;
-		}
-
-		if (opt->file_count) {
-			if (str_found_in_array(hdr->name,  found,
-					opt->files, opt->file_count)) {
-				print_hdr_name(hdr);
-			}
-		} else {
-			print_hdr_name(hdr);
-		}
-
-		if (parse_number(hdr->size, sizeof (hdr->size), &size) != 1) {
-			print_error("Malformed tar header");
-			rc = 2;
-			break;
-		}
-		if (skip_data(fp, size) != 0) {
-			print_error_eof();
-			rc = 2;
-			break;
-		}
-
-		block_num += (size + BLOCKSIZE - 1) / BLOCKSIZE;
-
+		block_num += ((size + BLOCKSIZE - 1) / BLOCKSIZE);
 	}
-
-	if (rc == 0 && opt-> file_count > 0) {
-		for (int i = 0; i < opt->file_count; ++i) {
-			if (!found[i]) {
-				print_file_not_found_archive(opt->files[i]);
-				++not_found_num;
-			}
-		}
-	}
-	if (not_found_num > 0) {
-		print_exist_prev_err();
-		rc = 2;
+	if (rc == 0) {
+		rc = report_nonfound(opt, found);
 	}
 
 	free(found);
@@ -419,12 +643,15 @@ list_archive(FILE *fp, struct options *opt)
 }
 
 static int
+list_archive(FILE *fp, struct options *opt)
+{
+	return (process_archive(fp, opt, list_handler));
+}
+
+static int
 extract_archive(FILE *fp, struct options *opt)
 {
-	/* TODO: -x used */
-	(void) fp;
-	(void) opt;
-	return (0);
+	return (process_archive(fp, opt, extract_handler));
 }
 
 int
@@ -438,18 +665,15 @@ main(int argc, char **argv)
 		return (2);
 	}
 
-	fp = fopen(opt.archive_name, "rb");
+	fp = open_file(opt.archive_name, "rb");
+
 	if (fp == NULL) {
-		fprintf(stderr, "mytar: %s: Cannot open: %s\n",
-			opt.archive_name, strerror(errno));
 		free(opt.files);
 		return (2);
 	}
-
 	if (opt.t_flag) {
 		rc = list_archive(fp, &opt);
 	} else {
-		/* TODO: 2nd phase implementation */
 		rc = extract_archive(fp, &opt);
 	}
 
