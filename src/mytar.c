@@ -515,9 +515,32 @@ extract_handler(FILE *archive, struct posix_header *hdr,
 }
 
 static int
-is_tar_header(struct posix_header *hdr)
+has_ustar_prefix(const struct posix_header *hdr)
 {
-	return (memcmp(hdr->magic, TMAGIC, TMAGLEN) == 0);
+	return (memcmp(hdr->magic, TMAGIC, TMAGLEN - 1) == 0);
+}
+
+static int
+is_posix_tar_header(const struct posix_header *hdr)
+{
+	return (has_ustar_prefix(hdr) &&
+		hdr->magic[TMAGLEN - 1] == '\0' &&
+		memcmp(hdr->version, TVERSION, TVERSLEN) == 0);
+}
+
+static int
+is_oldgnu_tar_header(const struct posix_header *hdr)
+{
+	return (has_ustar_prefix(hdr) &&
+		hdr->magic[TMAGLEN - 1] == ' ' &&
+		hdr->version[0] == ' ' &&
+		hdr->version[1] == '\0');
+}
+
+static int
+is_tar_header(const struct posix_header *hdr)
+{
+	return (is_posix_tar_header(hdr) || is_oldgnu_tar_header(hdr));
 }
 
 static int *
@@ -616,7 +639,8 @@ read_next_header(FILE *fp, unsigned char b[BLOCKSIZE], uint64_t *block_num)
  * listed, extracted, or skipped.
  */
 static int
-process_archive(FILE *fp, struct options *opt, fn_file_handler handler)
+process_archive(FILE *fp, struct options *opt,
+		fn_file_handler handler)
 {
 	unsigned char b[BLOCKSIZE];
 	uint64_t size;
@@ -642,8 +666,8 @@ process_archive(FILE *fp, struct options *opt, fn_file_handler handler)
 			break;
 		}
 
-		rc = process_header_block(fp, b, opt,
-			    found, handler, block_num, &size);
+		rc = process_header_block(fp, b, opt, found,
+			handler, block_num, &size);
 		if (rc != 0) {
 			break;
 		}
